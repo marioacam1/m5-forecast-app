@@ -10,6 +10,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import charts
 import client
 
 st.set_page_config(page_title="Pronóstico de demanda M5", page_icon="📈", layout="wide")
@@ -72,6 +73,49 @@ def run_query(records):
         return None
 
 
+def show_forecast(product, stored):
+    """Muestra la gráfica de los 28 días con filtros interactivos y las métricas del periodo filtrado."""
+    data = product.copy()
+    data["pronostico"] = stored["predictions"]
+    dates = list(pd.to_datetime(data["date"]).dt.date)
+
+    st.subheader("Ventas reales y pronóstico")
+    style = st.radio("Estilo de gráfica", list(charts.CHART_STYLES), horizontal=True, key="chart_style")
+    f1, f2, f3 = st.columns(3)
+    series = f1.multiselect("Series", charts.SERIES, default=charts.SERIES, key="chart_series")
+    day_type = f2.selectbox("Tipo de día", charts.DAY_TYPES, key="chart_day_type")
+    start, end = f3.select_slider(
+        "Rango de fechas", options=dates, value=(dates[0], dates[-1]),
+        format_func=charts.day_label, key="chart_range",
+    )
+
+    if not series:
+        st.info("Elige al menos una serie para dibujar la gráfica.")
+        return
+    shown = data[charts.filter_days(data, start, end, day_type).values]
+    if shown.empty:
+        st.info("Ningún día cumple los filtros. Amplía el rango de fechas o cambia el tipo de día.")
+        return
+
+    chart_df = pd.DataFrame(
+        {charts.REAL: shown["ventas_reales"].values, charts.FORECAST: shown["pronostico"].values},
+        index=pd.to_datetime(shown["date"]),
+    )
+    try:
+        st.altair_chart(charts.CHART_STYLES[style](chart_df[series]))
+    except Exception as exc:  # si un estilo falla, se muestra la gráfica básica
+        st.warning(f"No se pudo dibujar este estilo ({type(exc).__name__}). Se muestra la gráfica básica.")
+        st.line_chart(chart_df[series])
+
+    error = chart_df[charts.FORECAST] - chart_df[charts.REAL]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Error absoluto medio", f"{error.abs().mean():.2f} unidades")
+    m2.metric("Sesgo (pronóstico − real)", f"{error.mean():+.2f}")
+    m3.metric("Días mostrados", f"{len(chart_df)}")
+    info = stored["info"]
+    st.caption(f"Una sola petición de {len(data)} filas: {info['seconds']:.2f} s, {info['attempts']} intento(s).")
+
+
 try:
     sample = load_sample()
 except FileNotFoundError:
@@ -106,10 +150,17 @@ tab_real, tab_manual, tab_about = st.tabs(["Ejemplo real", "Entrada manual", "Ac
 
 # ---------------------------------------------------------------- ejemplo real
 with tab_real:
-    col_item, col_day = st.columns(2)
-    item = col_item.selectbox("Producto", sorted(sample["item_id"].unique()))
+    f_cat, f_dept, f_item, f_day = st.columns(4)
+    cat = f_cat.selectbox("Categoría", ["Todas"] + sorted(sample["cat_id"].unique()), key="real_cat")
+    by_cat = sample if cat == "Todas" else sample[sample["cat_id"] == cat]
+    dept = f_dept.selectbox("Departamento", ["Todos"] + sorted(by_cat["dept_id"].unique()), key="real_dept")
+    by_dept = by_cat if dept == "Todos" else by_cat[by_cat["dept_id"] == dept]
+    item = f_item.selectbox("Producto", sorted(by_dept["item_id"].unique()), key="real_item")
+
     product = sample[sample["item_id"] == item].sort_values("day_num").reset_index(drop=True)
-    day = col_day.selectbox("Día del periodo de prueba", product["date"].tolist(), index=len(product) - 1)
+    day = f_day.selectbox(
+        "Día del periodo de prueba", product["date"].tolist(), index=len(product) - 1, key="real_day"
+    )
     row = product[product["date"] == day].iloc[0]
 
     st.caption("Variables que recibe el modelo para ese día")
@@ -127,20 +178,13 @@ with tab_real:
             st.caption(f"Respuesta en {info['seconds']:.2f} s, {info['attempts']} intento(s).")
 
     if st.button("Pronosticar los 28 días de este producto"):
-        records = [client.to_record(r) for _, r in product.iterrows()]
-        result = run_query(records)
+        result = run_query([client.to_record(r) for _, r in product.iterrows()])
         if result:
-            predictions, info = result
-            chart = pd.DataFrame(
-                {"Ventas reales": product["ventas_reales"].values, "Pronóstico del modelo": predictions},
-                index=pd.to_datetime(product["date"]),
-            )
-            st.line_chart(chart)
-            mae = (chart["Ventas reales"] - chart["Pronóstico del modelo"]).abs().mean()
-            st.caption(
-                f"Error absoluto medio de este producto: {mae:.2f} unidades al día. "
-                f"Una sola petición de {len(records)} filas, {info['seconds']:.2f} s, {info['attempts']} intento(s)."
-            )
+            st.session_state["forecast"] = {"item": item, "predictions": result[0], "info": result[1]}
+
+    stored = st.session_state.get("forecast")
+    if stored and stored["item"] == item:
+        show_forecast(product, stored)
 
 # ---------------------------------------------------------------- entrada manual
 with tab_manual:
@@ -155,9 +199,9 @@ with tab_manual:
         return st.number_input(label, value=value, step=step, **limits)
 
     c1, c2 = st.columns(2)
-    cat_id = c1.selectbox("Categoría", list(DEPTS))
+    cat_id = c1.selectbox("Categoría", list(DEPTS), key="man_cat")
     dept_options = [d for group in DEPTS.values() for d in group] if relaxed else DEPTS[cat_id]
-    dept_id = c2.selectbox("Departamento", dept_options)
+    dept_id = c2.selectbox("Departamento", dept_options, key="man_dept")
 
     values = {
         "cat_id": cat_id,
